@@ -35,13 +35,19 @@ from typing import List, Tuple
 # ---------------------------------------------------------------------------
 # Параметры по умолчанию (мм)
 # ---------------------------------------------------------------------------
-TABLE_LENGTH = 3000   # Длина рабочего стола, мм
+TABLE_LENGTH = 2950   # Длина рабочего стола, мм
 TABLE_WIDTH = 1200    # Ширина рабочего стола, мм
 FILM_WIDTH = 1200     # Ширина рулона ПВХ-плёнки, мм
 GAP = 50              # Технологический зазор между фасадами, мм
 EDGE_GAP = 50         # Краевой отступ от краёв стола/плёнки, мм
 ALLOW_ROTATION = True  # Разрешить поворот фасадов на 90°
 ORDERS_FILE = "22.txt"  # Файл заказов (кодировка cp1251, блоки через #@#)
+
+# Правило оплаты плёнки за один стол: отрез >= BILL_THRESHOLD — берём
+# стандартный кусок BILL_FULL_CUT; короче — отрез + BILL_SMALL_EXTRA.
+BILL_THRESHOLD = 2000   # Порог длины отреза, мм
+BILL_FULL_CUT = 3200    # Стандартный кусок плёнки, мм
+BILL_SMALL_EXTRA = 300  # Припуск к короткому отрезу, мм
 
 # Тестовый набор из задания
 FACADES: List[List[int]] = [
@@ -414,26 +420,33 @@ def pack_tables(
 ) -> List[List[PlacedFacade]]:
     """Разложить фасады по столам: каждый стол — отрез плёнки длиной <= table_length.
 
-    Детали идут в заданном порядке; каждая ставится в текущий стол, а если
-    не помещается — открывается новый стол. Возвращает список столов, в каждом
+    First-fit: каждая деталь пробуется во все уже открытые столы по порядку,
+    новый стол открывается, только если деталь никуда не поместилась. Так
+    мелкие детали добивают пустоты в ранних столах, и столы заполняются
+    плотно (жадный вариант «одна деталь — один текущий стол» оставлял
+    ранние столы полупустыми навсегда). Возвращает список столов, в каждом
     координаты локальные (отсчёт от края своего стола).
     """
     max_top = table_length - edge_gap
-    tables: List[List[PlacedFacade]] = []
-    placed: List[PlacedFacade] = []
-    candidates: List[Tuple[int, int]] = [(edge_gap, edge_gap)]
+    # Состояние каждого стола: (placed, candidates). _place_single при
+    # неудаче (TableFull/ValueError) состояние не меняет — повторная
+    # попытка на следующем столе безопасна.
+    states: List[Tuple[List[PlacedFacade], List[Tuple[int, int]]]] = []
     for idx, a, b in order:
-        try:
-            _place_single(idx, a, b, placed, candidates,
-                          film_width, gap, allow_rotation, edge_gap, max_top)
-        except TableFull:
-            tables.append(placed)
+        for placed, candidates in states:
+            try:
+                _place_single(idx, a, b, placed, candidates,
+                              film_width, gap, allow_rotation, edge_gap, max_top)
+                break
+            except TableFull:
+                continue
+        else:
             placed = []
             candidates = [(edge_gap, edge_gap)]
             _place_single(idx, a, b, placed, candidates,
                           film_width, gap, allow_rotation, edge_gap, max_top)
-    if placed:
-        tables.append(placed)
+            states.append((placed, candidates))
+    tables = [placed for placed, _ in states]
     for t in tables:
         t.sort(key=lambda p: (p.y, p.x))
     return tables
@@ -508,6 +521,19 @@ def material_utilization(
     if film_length <= 0:
         return 0.0
     return calculate_facade_area(facades) * 1_000_000.0 / (film_width * film_length)
+
+
+def billed_film_length(film_length: int) -> int:
+    """Плёнки к оплате за один стол, мм.
+
+    Отрез >= BILL_THRESHOLD — стандартный кусок BILL_FULL_CUT;
+    короче — отрез + BILL_SMALL_EXTRA. Нулевому отрезу — 0.
+    """
+    if film_length <= 0:
+        return 0
+    if film_length >= BILL_THRESHOLD:
+        return BILL_FULL_CUT
+    return film_length + BILL_SMALL_EXTRA
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +729,9 @@ def print_report(
     labels: List[str] | None = None,
 ) -> None:
     lengths = [calculate_film_length(t, edge_gap) for t in tables]
+    billed = [billed_film_length(ln) for ln in lengths]
     total = sum(lengths)
+    billed_total = sum(billed)
     area = calculate_facade_area(facades)
     util = material_utilization(facades, film_width, total)
     print(f"Количество фасадов:            {len(facades)}")
@@ -713,10 +741,12 @@ def print_report(
     print(f"Технологический зазор:         {gap} мм")
     print(f"Краевой отступ от краёв:       {edge_gap} мм")
     print(f"Столов (отрезов) нужно:        {len(tables)}")
-    for i, ln in enumerate(lengths, 1):
-        print(f"  Стол {i}: длина отреза       {ln} мм ({ln / 1000:.3f} пог. м)")
+    for i, (ln, bl) in enumerate(zip(lengths, billed), 1):
+        print(f"  Стол {i}: длина отреза       {ln} мм ({ln / 1000:.3f} пог. м), "
+              f"плёнки брать {bl} мм")
     print(f"Суммарная длина плёнки:        {total} мм")
     print(f"Суммарный расход:              {total / 1000:.3f} пог. м")
+    print(f"Итого плёнки к оплате:         {billed_total} мм ({billed_total / 1000:.3f} пог. м)")
     print(f"Коэффициент использования:     {util:.1%}")
     for i, (t, ln) in enumerate(zip(tables, lengths), 1):
         print_table_report(t, i, len(tables), film_width, ln, labels)
